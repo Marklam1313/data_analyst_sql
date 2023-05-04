@@ -1,0 +1,321 @@
+-- sku_list # EXTRACT LAST 3 month have stock product
+WITH step_1 AS 
+(
+  
+SELECT 
+  DISTINCT shop_code,
+  sku_id,
+  MAX(CASE WHEN available_qty > 0 THEN date END) AS last_available_date,
+  MIN(CASE 
+        WHEN available_qty > 0 
+        AND DATE(date) BETWEEN DATE_TRUNC(DATE_SUB(CURRENT_DATE("Asia/Hong_Kong"),INTERVAL 3 month),month) 
+        AND CURRENT_DATE("Asia/Hong_Kong") THEN date END) AS first_available_date
+
+  FROM `algebraic-pier-225203.Sales.hktvmall_pos_inventory_and_replenishment`
+  GROUP BY 1,2
+  HAVING DATE(last_available_date) BETWEEN DATE_TRUNC(DATE_SUB(CURRENT_DATE("Asia/Hong_Kong"),INTERVAL 3 month),month)
+    AND CURRENT_DATE("Asia/Hong_Kong") 
+    
+) 
+, 
+
+-- # create date array  
+step_2 AS 
+(
+SELECT sku_id,
+shop_code,
+gen_date
+FROM 
+(SELECT sku_id, shop_code,
+GENERATE_DATE_ARRAY(DATE_TRUNC(DATE_SUB(CURRENT_DATE("Asia/Hong_Kong"),INTERVAL 3 month),month),CURRENT_DATE("Asia/Hong_Kong")-1) as gen_date_nested 
+FROM step_1
+)
+CROSS JOIN UNNEST(gen_date_nested ) AS gen_date 
+--  where sku_id="H0888001_S_10000371" and shop_code="SAV"
+)
+,
+
+pre_count AS
+(
+SELECT DISTINCT a.sku_id, 
+a.shop_code, 
+a.first_available_date, a.last_available_date, b.gen_date, c.* EXCEPT(shop_code, sku_id)
+FROM step_1 a
+JOIN step_2 b 
+  ON a.sku_id = b.sku_id
+  AND a.shop_code = b.shop_code
+LEFT JOIN `algebraic-pier-225203.Sales.hktvmall_pos_inventory_and_replenishment` c
+  ON a.sku_id = c.sku_id 
+  AND a.shop_code = c.shop_code
+  AND b.gen_date = DATE(c.date)
+-- WHERE a.sku_id = 'H0888001_S_10151302'
+-- AND a.shop_code = 'JOR'
+ORDER BY gen_date ASC, available_qty DESC
+)
+,
+
+sales AS 
+(
+SELECT a.sku_id, s.sku_name_chi, 
+a.shop_code, 
+FORMAT_DATE('%b %Y', DATE(gen_date)) AS month, SUM(s.total_price) AS gmv, SUM(s.quantity) AS quantity
+FROM pre_count a
+JOIN `algebraic-pier-225203.Sales.sales_master` s
+  ON a.sku_id = IFNULL(s.bundle_set, s.sku_id)
+  AND DATE(a.gen_date) = DATE(s.order_time)
+  AND a.shop_code = s.takeaway_store
+WHERE s.takeaway_store IS NOT NULL
+AND sales_application = 'POS'
+GROUP BY 1,2,
+3,
+month
+
+)
+,
+
+no_sales AS 
+(
+SELECT shop_code, sku_id, FORMAT_DATE('%b %Y', DATE(gen_date)) AS month,
+ COUNT(DISTINCT CASE WHEN available_qty > 0 THEN gen_date END) AS no_movement_day FROM pre_count 
+WHERE CONCAT(shop_code, sku_id, gen_date) NOT IN (SELECT DISTINCT CONCAT(shop_code, sku_id, gen_date) FROM 
+(
+SELECT a.sku_id, a.shop_code, gen_date
+FROM pre_count a
+JOIN `algebraic-pier-225203.Sales.sales_master` s
+  ON a.sku_id = IFNULL(s.bundle_set, s.sku_id)
+  AND DATE(a.gen_date) = DATE(s.order_time)
+  AND a.shop_code = s.takeaway_store
+WHERE s.takeaway_store IS NOT NULL
+AND sales_application = 'POS'
+)
+)
+GROUP BY 1,2,3
+)
+,
+
+replenishment AS 
+(
+SELECT sku_id, shop_code, month, replenishment_job_max_qty, replenishment_job_min_order_qty
+FROM
+(
+SELECT sku_id, shop_code,
+FORMAT_DATE('%b %Y', DATE(gen_date)) AS month, replenishment_job_max_qty, replenishment_job_min_order_qty, RANK() OVER (PARTITION BY shop_code, sku_id, LEFT(STRING(date), 7) ORDER BY date DESC) AS seq
+FROM pre_count
+)
+WHERE seq = 1
+AND (
+  replenishment_job_max_qty IS NOT NULL
+  OR replenishment_job_min_order_qty IS NOT NULL
+)
+)
+,
+
+soh AS 
+(
+SELECT sku_id, shop_code, month, available_qty AS current_soh
+FROM
+(
+SELECT sku_id, shop_code,
+FORMAT_DATE('%b %Y', DATE(gen_date)) AS month, available_qty, RANK() OVER (PARTITION BY shop_code, sku_id, LEFT(STRING(date), 7) ORDER BY date DESC) AS seq
+FROM pre_count
+)
+WHERE seq = 1
+AND (
+  available_qty IS NOT NULL
+ 
+)
+)
+,
+
+# add sales by day
+sales_by_day AS 
+(
+SELECT a.sku_id, s.sku_name_chi, 
+a.shop_code, 
+DATE(gen_date) AS gen_date, SUM(s.total_price) AS gmv, SUM(s.quantity) AS quantity
+FROM pre_count a
+JOIN `algebraic-pier-225203.Sales.sales_master` s
+  ON a.sku_id = IFNULL(s.bundle_set, s.sku_id)
+  AND DATE(a.gen_date) = DATE(s.order_time)
+  AND a.shop_code = s.takeaway_store
+WHERE s.takeaway_store IS NOT NULL
+AND sales_application = 'POS'
+GROUP BY 1,2,
+3,4
+
+)
+,
+
+numbers AS 
+(
+SELECT a.sku_id, 
+a.shop_code, 
+a.first_available_date, a.last_available_date, 
+c.replenishment_job_max_qty, 
+c.replenishment_job_min_order_qty,
+d.no_movement_day,
+
+# add current SOH
+f.current_soh,
+
+FORMAT_DATE('%b %Y', DATE(a.gen_date)) AS month,
+IFNULL(COUNT(DISTINCT CASE WHEN a.gen_date >= DATE(first_available_date) AND available_qty > 0 AND e.quantity > 0 THEN a.gen_date END), 0) AS in_stock_day,
+IFNULL(COUNT(DISTINCT CASE WHEN a.gen_date >= DATE(first_available_date) AND available_qty <= 0 AND a.replenishment_job_max_qty > 0 THEN a.gen_date END), 0) AS oos_day,
+MAX(CASE WHEN available_qty > 0 THEN a.gen_date END) AS sku_base_reference_date,
+MIN(CASE WHEN available_qty <= 0 THEN a.gen_date END) AS oos_reference_date
+FROM pre_count a
+LEFT JOIN sales b
+  ON a.sku_id = b.sku_id
+  AND a.shop_code = b.shop_code
+  AND FORMAT_DATE('%b %Y', DATE(a.gen_date)) = b.month
+JOIN replenishment c
+  ON a.sku_id = c.sku_id
+  AND a.shop_code = c.shop_code
+  AND FORMAT_DATE('%b %Y', DATE(a.gen_date)) = c.month
+  AND a.date IS NOT NULL
+LEFT JOIN no_sales d
+  ON a.sku_id = d.sku_id
+  AND a.shop_code = d.shop_code
+  AND FORMAT_DATE('%b %Y', DATE(a.gen_date)) = d.month
+LEFT JOIN sales_by_day e 
+  ON a.sku_id = e.sku_id 
+  AND a.shop_code = e.shop_code
+  AND a.gen_date = e.gen_date
+  LEFT JOIN soh f
+  ON a.sku_id = f.sku_id
+  AND a.shop_code = f.shop_code
+  AND FORMAT_DATE('%b %Y', DATE(a.gen_date)) = f.month
+GROUP BY 1,2,3,4,5,6,7,
+8,9,
+month
+)
+,
+
+pos_category AS 
+(
+SELECT DISTINCT a.sku_id, s.sku_name_chi, s.sub_cat_1_name_chi, s.sub_cat_2_name_chi, s.sub_cat_3_name_chi,
+CASE
+  WHEN REGEXP_CONTAINS(a.sku_id, "dollar") AND (REGEXP_CONTAINS(a.sku_id, "H0888001") OR REGEXP_CONTAINS(a.sku_id, "H0001001")) THEN 'Outlet SKUs'
+  WHEN LEFT(primary_category, 10) = 'AA11112730' THEN 'Ice-cream'
+  WHEN 
+
+  (LEFT(primary_category, 8) ='AA111157' and REGEXP_CONTAINS(a.sku_id,"H1688001"))
+or 
+(LEFT(primary_category, 8) = 'AA110813' or LEFT(primary_category, 8) = 'AA110810')
+  THEN 'Fruits'
+  
+  WHEN　REGEXP_CONTAINS(a.sku_id,"H1688001") or LEFT(primary_category, 8) = 'AA110815' THEN 'Vegetables'
+  WHEN LEFT(primary_category, 6) = 'AA1130' THEN 'Wine'
+  WHEN LEFT(primary_category, 8) = 'AA116010' THEN 'Bread'
+  WHEN storage_type = 'B' THEN 'Eggs'
+  WHEN storage_type = 'F' THEN 'Chilled Food'
+  WHEN storage_type IN ('G', 'J') THEN 'Frozen Food'
+  WHEN LEFT(primary_category, 6) in ('AA1172','AA1175','AA1180','AA1182','AA1185','AA1192','AA1196') 
+  OR   LEFT(primary_category, 4) in ('AA13','AA16','AA17','AA18','AA22','AA26','AA28','AA30','AA31','AA32','AA33','AA37','AA42','AA47','AA52','AA60','AA61','AA65','AA70','AA73','AA75','AA80','AA83','AA85','AA87','AA90','AA95') THEN 'Non-food grocery'
+ELSE 'Food grocery'
+END as pos_category_type
+FROM step_1 a
+JOIN `algebraic-pier-225203.Sales.sales_master` s
+  ON a.sku_id = IFNULL(s.bundle_set, s.sku_id)
+)
+,
+
+final AS 
+(
+SELECT *, 
+IFNULL(SAFE_MULTIPLY(avg_daily_qty, oos_day), 0) AS potential_qty_loss,
+IFNULL(SAFE_MULTIPLY(avg_daily_gmv, oos_day), 0) AS potential_gmv_loss,
+SAFE_MULTIPLY(avg_daily_qty, 4) AS suggested_min,
+
+FROM
+(
+SELECT c.sku_name_chi, c.pos_category_type, c.sub_cat_1_name_chi, c.sub_cat_2_name_chi, c.sub_cat_3_name_chi, 
+sm.Shop_Name, 
+a.*, 
+IFNULL(b.gmv, 0) AS gmv, IFNULL(b.quantity, 0) AS quantity, 
+IFNULL(SAFE_DIVIDE(b.quantity, in_stock_day), 0) AS avg_daily_qty, IFNULL(SAFE_DIVIDE(b.gmv, in_stock_day), 0) AS avg_daily_gmv,
+ sm.AM, sm.DM
+FROM numbers a
+LEFT JOIN sales b
+  ON a.sku_id = b.sku_id
+  AND a.shop_code = b.shop_code
+  AND a.month = b.month
+LEFT JOIN pos_category c
+  ON a.sku_id = c.sku_id
+LEFT JOIN `algebraic-pier-225203.Sales.HKTV_shop_mapping` sm
+  ON a.shop_code = sm.Code
+)
+)
+,
+
+numbers_by_sku AS 
+(
+SELECT month, sku_id,
+SUM(in_stock_day) AS in_stock_day,
+-- SUM(sales_day) AS sales_day,
+-- SUM(no_sales_day) AS no_sales_day,
+SUM(no_movement_day) AS no_movement_day,
+SUM(oos_day) AS oos_day,
+SUM(current_soh) AS total_soh
+FROM numbers
+GROUP BY 1,2
+)
+,
+
+sales_by_sku AS 
+(
+SELECT month, sku_id, SUM(gmv) AS gmv, SUM(quantity) AS quantity
+FROM sales 
+GROUP BY 1,2
+)
+,
+
+store_count_by_sku AS 
+(
+SELECT 
+sku_id, 
+-- shop_code, 
+FORMAT_DATE('%b %Y', DATE(gen_date)) AS month,
+COUNT(DISTINCT CASE WHEN available_qty > 0 THEN shop_code END) AS available_store
+FROM pre_count
+GROUP BY 1,
+-- 2,
+month
+
+)
+,
+
+final_by_sku AS 
+(
+SELECT *, 
+IFNULL(SAFE_MULTIPLY(avg_daily_qty, avg_oos_day), 0) AS potential_qty_loss,
+IFNULL(SAFE_MULTIPLY(avg_daily_gmv, avg_oos_day), 0) AS potential_gmv_loss,
+IFNULL(SAFE_DIVIDE(total_soh, avg_daily_qty), 0) AS soh,
+CASE
+  WHEN pos_category_type = 'Non-food grocery' OR pos_category_type = 'Food grocery' OR pos_category_type = 'Wine' THEN SAFE_MULTIPLY(avg_daily_qty, 3) ELSE SAFE_MULTIPLY(avg_daily_qty, 4) END AS suggested_min
+FROM
+(
+SELECT c.sku_name_chi, c.pos_category_type, c.sub_cat_1_name_chi, c.sub_cat_2_name_chi, c.sub_cat_3_name_chi, 
+-- sm.Shop_Name, 
+a.* EXCEPT(no_movement_day, oos_day, in_stock_day), SAFE_DIVIDE(a.in_stock_day, s.available_store) AS avg_in_stock_day, SAFE_DIVIDE(a.no_movement_day, s.available_store) AS avg_no_movement_day, SAFE_DIVIDE(a.oos_day, s.available_store) AS avg_oos_day,
+IFNULL(b.gmv, 0) AS gmv, IFNULL(b.quantity, 0) AS qty, IFNULL(SAFE_DIVIDE(b.quantity, in_stock_day), 0) AS avg_daily_qty, IFNULL(SAFE_DIVIDE(b.gmv, in_stock_day), 0) AS avg_daily_gmv, 
+s.available_store
+--  sm.AM, sm.DM
+FROM numbers_by_sku a
+JOIN sales_by_sku b
+  ON a.sku_id = b.sku_id
+  -- AND a.shop_code = b.shop_code
+  AND a.month = b.month
+JOIN pos_category c
+  ON a.sku_id = c.sku_id
+LEFT JOIN store_count_by_sku s 
+  ON a.sku_id = s.sku_id
+  AND a.month = s.month
+-- LEFT JOIN `algebraic-pier-225203.Sales.HKTV_shop_mapping` sm
+  -- ON a.shop_code = sm.Code
+)
+)
+
+
+SELECT *
+FROM final_by_sku
