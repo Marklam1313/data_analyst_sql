@@ -1,0 +1,291 @@
+WITH traffic AS (
+
+SELECT 
+customer_pk2, date, source, medium, campaign, campaign_street_code, 
+CASE
+  WHEN campaign_street_code = 'AA16' THEN 'skincare_makeup'
+  WHEN campaign_street_code = 'AA32' THEN 'electrical_appliances'
+  WHEN campaign_street_code = 'AA31' THEN 'gadgets_electronics'
+  WHEN campaign_street_code = 'AA18' THEN 'housewares'
+  WHEN campaign_street_code = 'AA28' THEN 'mother_baby'
+  WHEN campaign_street_code = 'AA13' THEN 'personal_care'
+  WHEN campaign_street_code = 'AA83' THEN 'pets'
+  WHEN campaign_street_code = 'AA11' THEN 'supermarket'
+  END AS campaign_street,
+
+campaign_type, last_campaign_time, 
+-- campaign_month
+
+FROM (
+
+SELECT
+date, c.value AS customer_pk2, trafficSource.source AS source, trafficSource.medium AS medium, trafficSource.campaign AS campaign, DATETIME(TIMESTAMP_SECONDS(visitStartTime), 'Asia/Hong_Kong') AS last_campaign_time,
+
+
+CASE 
+  WHEN trafficSource.campaign LIKE '%sem%' THEN SUBSTR(trafficSource.campaign, -6, 4)
+  WHEN trafficSource.campaign LIKE '%shopping%' THEN SUBSTR(trafficSource.campaign, -4)
+  ELSE trafficSource.campaign
+  END AS campaign_street_code,
+
+CASE
+  WHEN trafficSource.campaign LIKE '%sem%' THEN 'SEM'
+  WHEN trafficSource.campaign LIKE '%shopping%' THEN 'Shopping'
+  ELSE trafficSource.campaign
+  END AS campaign_type
+
+FROM `open-data-bank.115117564.ga_sessions_*`, UNNEST(customDimensions) AS c
+WHERE 
+# udpate time range
+  PARSE_DATE("%Y%m%d",REPLACE(_TABLE_SUFFIX, 'intraday_','')) BETWEEN '2022-07-01' AND CURRENT_DATE('Asia/Hong_Kong')
+
+  AND 
+      
+  trafficSource.medium = 'cpc' AND c.index = 16 AND trafficSource.campaign LIKE 'ecmkg_mall_alwayson_%' AND trafficSource.isTrueDirect IS NULL
+  AND
+# eg. ecmkg_mall_alwayson_semBH_sem_conversion_cream_AA1310
+  (trafficSource.campaign LIKE '%_sem_conversion%' 
+  -- OR trafficSource.campaign LIKE '%sem%' OR trafficSource.campaign LIKE '%_SEM_CONVERSION' OR trafficSource.campaign LIKE '%_sem_conversion_%'
+
+  OR  
+# eg. ecmkg_mall_alwayson_shopping_maxconversion_sm_AA11
+  trafficSource.campaign LIKE '%_shopping_%')
+
+) AS temp
+
+),
+
+sales AS (
+
+SELECT
+b.customer_pk2,
+b.u_membership_level,
+b.order_number,
+MAX(a.last_campaign_time) AS campaign_time,
+b.order_time,
+a.campaign,
+a.campaign_street_code,
+a.campaign_street,
+a.campaign_type,
+b.pets_gmv,
+b.dining_offers_gmv,
+b.personal_care_health_gmv,
+b.supermarket_gmv,
+b.electrical_appliances_gmv,
+b.skincare_makeup_gmv,
+b.sports_travel_gmv,
+b.insurance_finance_gmv,
+b.gadgets_electronics_gmv,
+b.mother_baby_gmv,
+b.toys_books_gmv,
+b.housewares_gmv,
+
+
+CASE
+  WHEN regexp_contains(SUBSTR(b.primary_category_bought, 1, 40), campaign_street_code) THEN TRUE
+  ELSE FALSE
+  END AS Boolean,
+
+FROM (
+    
+  SELECT
+  DATETIME(order_time_gcp, 'Asia/Hong_Kong') AS order_time,
+  -- EXTRACT(MONTH FROM order_time) AS order_month,
+  customer_pk2,
+  u_membership_level,
+  order_number,
+
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA83' THEN total_price END) AS pets_gmv,
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA95' THEN total_price END) AS dining_offers_gmv,
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA13' THEN total_price END) AS personal_care_health_gmv,
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA11' THEN total_price END) AS supermarket_gmv,
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA32' THEN total_price END) AS electrical_appliances_gmv,
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA16' THEN total_price END) AS skincare_makeup_gmv,
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA73' THEN total_price END) AS sports_travel_gmv,
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA52' THEN total_price END) AS insurance_finance_gmv,
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA31' THEN total_price END) AS gadgets_electronics_gmv,
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA28' THEN total_price END) AS mother_baby_gmv,
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA87' THEN total_price END) AS toys_books_gmv,
+  SUM(CASE WHEN LEFT(primary_category, 4) = 'AA18' THEN total_price END) AS housewares_gmv,
+
+  STRING_AGG(LEFT(primary_category, 4)) AS primary_category_bought
+
+
+  FROM `algebraic-pier-225203.Sales.sales_master`
+
+
+  WHERE 
+
+  DATE(order_time)  BETWEEN '2022-05-14' AND CURRENT_DATE('Asia/Hong_Kong')
+
+  GROUP BY customer_pk2, u_membership_level, order_time, order_number
+  ORDER BY customer_pk2, order_number
+) AS b
+
+RIGHT JOIN traffic a
+  ON SAFE_CAST(a.customer_pk2 AS INT64) = b.customer_pk2 
+    and b.order_time > a.last_campaign_time
+
+
+WHERE campaign IS NOT NULL AND campaign != '' 
+  AND ABS(DATE_DIFF(b.order_time, a.last_campaign_time, DAY)) < 1
+
+GROUP BY 
+b.customer_pk2,
+b.u_membership_level,
+b.order_number,
+b.order_time,
+a.campaign,
+a.campaign_street_code,
+a.campaign_street,
+a.campaign_type,
+b.pets_gmv,
+b.dining_offers_gmv,
+b.personal_care_health_gmv,
+b.supermarket_gmv,
+b.electrical_appliances_gmv,
+b.skincare_makeup_gmv,
+b.sports_travel_gmv,
+b.insurance_finance_gmv,
+b.gadgets_electronics_gmv,
+b.mother_baby_gmv,
+b.toys_books_gmv,
+b.housewares_gmv,
+-- b.furniture_gmv,
+Boolean
+-- a.campaign_month
+
+
+)
+,
+
+past_transaction AS 
+(
+SELECT customer_pk2, order_time, order_number, DATE(last_transaction_time) AS last_transaction_date
+FROM
+(
+SELECT customer_pk2, order_number, order_time, last_transaction_time, ROW_NUMBER() OVER (PARTITION BY order_number ORDER BY last_transaction_time DESC) AS seq
+FROM
+(
+SELECT DISTINCT sales.customer_pk2, sales.order_number, sales.order_time, s.order_number AS past_order_number, s.order_time AS last_transaction_time
+FROM `algebraic-pier-225203.Sales.sales_master` s
+JOIN sales
+ON s.customer_pk2 = sales.customer_pk2
+AND s.order_time < DATETIME(sales.order_time)
+)
+)
+WHERE seq = 1
+)
+,
+
+first_purchase_or_not AS 
+(
+SELECT customer_pk2, first_order_number
+FROM 
+(
+SELECT 
+s.customer_pk2, sales.order_number, s.order_number AS first_order_number, ROW_NUMBER() OVER (PARTITION BY s.customer_pk2 ORDER BY s.order_time ASC) AS item
+FROM `algebraic-pier-225203.Sales.sales_master` s
+JOIN sales
+ON s.customer_pk2 = sales.customer_pk2
+WHERE s.sales_application != 'POS'
+AND app_type = 'MAIN'
+)
+WHERE item = 1
+)
+,
+
+session AS 
+(
+
+SELECT
+    DISTINCT PARSE_DATE("%Y%m%d", date) AS search_date,
+    CONCAT(fullVisitorId, "-", CAST(visitStartTime AS STRING)) AS session_id,
+    MAX(IF(cd.INDEX = 16, cd.value, NULL)) AS customer_pk2,
+    s.campaign_time, s.order_time, s.campaign, s.order_number,
+FROM `open-data-bank.115117564.ga_sessions_*` AS haha,
+    UNNEST(customDimensions) cd,
+    UNNEST(hits) h
+JOIN sales s
+ON SAFE_CAST(s.customer_pk2 AS STRING) = cd.value
+WHERE (
+  # CHANGE TIME
+      PARSE_DATE("%Y%m%d",REPLACE(_TABLE_SUFFIX, 'intraday_','')) BETWEEN '2022-07-01' AND CURRENT_DATE('Asia/Hong_Kong'))
+    AND totals.visits=1
+    AND PARSE_DATE("%Y%m%d", date) < s.order_time
+
+GROUP BY 1,2,4,5,6,7
+having REGEXP_CONTAINS(customer_pk2,r'^[0-9]{13,14}$')
+)
+,
+
+past_record AS 
+
+(
+
+SELECT 
+customer_pk2, order_number, order_time, 
+COUNT(order_number) 
+OVER (
+  PARTITION BY customer_pk2
+  ORDER BY order_number
+  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS no_of_transaction,
+MAX(search_date) AS last_visit_date,
+COUNT(DISTINCT session_id) AS no_of_visit,
+
+
+FROM
+(
+
+###
+SELECT
+sales.customer_pk2, session.session_id, session.search_date, DATE(s.order_time), s.order_number, s.order_time
+FROM sales 
+JOIN session 
+ON session.customer_pk2 = SAFE_CAST(sales.customer_pk2 AS STRING)
+JOIN `algebraic-pier-225203.Sales.sales_master` s
+ON s.customer_pk2 = sales.customer_pk2
+WHERE session.search_date <= sales.order_time
+AND s.order_time BETWEEN '2022-07-01' AND CURRENT_DATE('Asia/Hong_Kong')
+###
+
+)
+GROUP BY customer_pk2, order_number, order_time
+-- HAVING last_visit_date < DATE(order_time)
+)
+,
+
+final_table AS
+(
+SELECT s.*, p.no_of_transaction, t.last_transaction_date,
+
+CASE WHEN DATE_DIFF(DATE(s.order_time), t.last_transaction_date, DAY) <= 7 THEN 'Y' END AS transaction_in_7d,
+CASE WHEN DATE_DIFF(DATE(s.order_time), t.last_transaction_date, DAY) <= 14 THEN 'Y' END AS transaction_in_14d,
+CASE WHEN DATE_DIFF(DATE(s.order_time), t.last_transaction_date, DAY) <= 30 THEN 'Y' END AS transaction_in_30d,
+CASE WHEN DATE_DIFF(DATE(s.order_time), t.last_transaction_date, DAY) <= 60 THEN 'Y' END AS transaction_in_60d,
+CASE WHEN DATE_DIFF(DATE(s.order_time), t.last_transaction_date, DAY) <= 90 THEN 'Y' END AS transaction_in_90d,
+CASE WHEN DATE_DIFF(DATE(s.order_time), t.last_transaction_date, DAY) <= 180 THEN 'Y' END AS transaction_in_180d,
+
+CASE WHEN f.first_order_number = s.order_number THEN 'Y' END AS first_purchase_boolean,
+
+p.no_of_visit, p.last_visit_date,
+
+CASE WHEN DATE_DIFF(DATE(s.order_time), p.last_visit_date, DAY) <= 7 THEN 'Y' END AS visit_in_7d,
+CASE WHEN DATE_DIFF(DATE(s.order_time), p.last_visit_date, DAY) <= 14 THEN 'Y' END AS visit_in_14d,
+CASE WHEN DATE_DIFF(DATE(s.order_time), p.last_visit_date, DAY) <= 30 THEN 'Y' END AS visit_in_30d,
+CASE WHEN DATE_DIFF(DATE(s.order_time), p.last_visit_date, DAY) <= 60 THEN 'Y' END AS visit_in_60d,
+CASE WHEN DATE_DIFF(DATE(s.order_time), p.last_visit_date, DAY) <= 90 THEN 'Y' END AS visit_in_90d,
+CASE WHEN DATE_DIFF(DATE(s.order_time), p.last_visit_date, DAY) <= 180 THEN 'Y' END AS visit_in_180d
+
+FROM sales s 
+LEFT JOIN past_record p
+ON p.order_number = s.order_number
+LEFT JOIN past_transaction t  
+ON t.order_number = s.order_number
+LEFT JOIN first_purchase_or_not f
+ON f.customer_pk2 = s.customer_pk2
+
+)
+
+SELECT * FROM final_table
