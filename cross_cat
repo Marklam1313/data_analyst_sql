@@ -1,0 +1,154 @@
+WITH fixed_table AS 
+(  
+  select l.cat_list, c1.cat_code
+  FROM `algebraic-pier-225203.temp_bi.crosscat_target_cat` l
+  left join `open-data-bank.scheduler_aggregated.category` c1 on l.cat_code = c1.sub_cat_1_code
+  where right(l.cat_code,1) = "0" and subcat_level = '1'
+
+  union all
+
+  select l.cat_list, c2.cat_code
+  FROM `algebraic-pier-225203.temp_bi.crosscat_target_cat` l
+  left join `open-data-bank.scheduler_aggregated.category` c2 on l.cat_code = c2.sub_cat_2_code
+  where right(l.cat_code,1) = "0" and subcat_level = '2'
+
+  union all
+
+  select l.cat_list, c3.cat_code
+  FROM `algebraic-pier-225203.temp_bi.crosscat_target_cat` l
+  left join `open-data-bank.scheduler_aggregated.category` c3 on l.cat_code = c3.sub_cat_3_code
+  where right(l.cat_code,1) = "0" and subcat_level = '3'
+
+  union all
+
+  select l.cat_list, c4.cat_code
+  FROM `algebraic-pier-225203.temp_bi.crosscat_target_cat` l
+  left join `open-data-bank.scheduler_aggregated.category` c4 on l.cat_code = c4.sub_cat_4_code
+  where right(l.cat_code,1) = "0" and subcat_level = '4'
+
+  union all
+
+  select l.cat_list, l.cat_code
+  FROM `algebraic-pier-225203.temp_bi.crosscat_target_cat` l
+  where right(l.cat_code,1) = "1" 
+)
+,
+
+table_1_1 AS 
+(
+SELECT pk.customer_pk, a.customer_pk2, s.u_membership_level, MIN(CASE WHEN sales_application != 'POS' THEN DATE(order_time) END) AS first_purchase_date, MAX(CASE WHEN sales_application != 'POS' THEN DATE(order_time) END) AS last_purchase_date, 
+FROM `algebraic-pier-225203.temp_bi.crosscat_pk` a
+LEFT JOIN `project-bi-crm.user_mapping.pk_mapper_v2` pk
+  ON SAFE_CAST(a.customer_pk2 AS STRING) = pk.customer_pk2
+LEFT JOIN `algebraic-pier-225203.Sales.sales_master` s
+  ON a.customer_pk2 = SAFE_CAST(s.customer_pk2 AS STRING)
+WHERE DATE(order_time) BETWEEN '2022-04-01' AND '2023-03-31'
+  -- AND sales_application != 'POS'
+  -- AND app_type != 'LITE'
+  -- AND u_membership != 'SENIOR'
+GROUP BY 1,2,3
+
+)
+,
+
+table_1_2 AS 
+(
+SELECT customer_pk2, SAFE_ADD(SUM(discount_per_order), SUM(voucher_per_order)) AS total_discount
+FROM
+(
+SELECT a.customer_pk2, s.order_number, MAX(SAFE_CAST(IFNULL(cash_voucher_applied_value, '0') AS FLOAT64)) AS discount_per_order, MAX(IFNULL(paid_voucher_applied_value, 0)) AS voucher_per_order,
+FROM `algebraic-pier-225203.temp_bi.crosscat_pk` a
+LEFT JOIN `project-bi-crm.user_mapping.pk_mapper_v2` pk
+  ON SAFE_CAST(a.customer_pk2 AS STRING) = pk.customer_pk2
+JOIN `algebraic-pier-225203.Sales.sales_master` s
+  ON a.customer_pk2 = SAFE_CAST(s.customer_pk2 AS STRING)
+WHERE DATE(order_time) BETWEEN '2022-04-01' AND '2023-03-31'
+  AND app_type = 'MAIN'
+  -- AND sales_application != 'POS'
+  -- AND app_type != 'LITE'
+GROUP BY 1,2
+)
+GROUP BY 1
+)
+,
+
+table_1_3 AS 
+(
+SELECT a.customer_pk2, 
+SUM(total_price) AS gmv, 
+COUNT(DISTINCT DATE_TRUNC(DATE(order_time), MONTH)) AS purchased_month,
+FROM `algebraic-pier-225203.temp_bi.crosscat_pk` a
+JOIN `algebraic-pier-225203.Sales.sales_master` s
+  ON a.customer_pk2 = SAFE_CAST(s.customer_pk2 AS STRING)
+WHERE app_type = 'MAIN'
+  AND DATE(order_time) BETWEEN '2022-04-01' AND '2023-03-31'
+GROUP BY 1
+)
+,
+
+
+pre_pivot_4 AS 
+(
+SELECT cat_list, a.customer_pk2, 
+COUNT(DISTINCT IFNULL(additional_parent_order, order_number)) AS cat_order_count, 
+SUM(total_price) AS cat_gmv,
+COUNT(DISTINCT CONCAT(order_number, sku_id)) AS cat_sku_line,
+COUNT(DISTINCT DATE_TRUNC(DATE(order_time), MONTH)) AS cat_purchased_month,
+
+FROM `algebraic-pier-225203.temp_bi.crosscat_pk` a
+LEFT JOIN `algebraic-pier-225203.Sales.sales_master`  s
+  ON SAFE_CAST(a.customer_pk2 AS FLOAT64) = s.customer_pk2
+INNER JOIN fixed_table t 
+  ON s.primary_category = t.cat_code
+WHERE DATE(order_time) BETWEEN '2022-04-01' AND '2023-03-31'
+  -- AND sales_application != 'POS'
+  AND app_type = 'MAIN'
+GROUP BY 1,2
+
+)
+,
+
+table_1_4_1 AS 
+(
+SELECT * 
+FROM pre_pivot_4
+PIVOT(SUM(cat_order_count) AS cat_order_count, SUM(cat_gmv) AS cat_gmv, SUM(cat_sku_line) AS cat_sku_line, SUM(cat_purchased_month) AS cat_purchased_month FOR cat_list IN ('cat_1', 'cat_2', 'cat_3', 'cat_4', 'cat_5', 'cat_6', 'cat_7', 'cat_8', 'cat_9', 'cat_10', 'cat_11', 'cat_12', 'cat_13', 'cat_14', 'cat_15', 'cat_16', 'cat_17', 'cat_18', 'cat_19', 'cat_20', 'cat_21', 'cat_22', 'cat_23', 'cat_24', 'cat_25', 'cat_26', 'cat_27', 'cat_28', 'cat_29', 'cat_30', 'cat_31', 'cat_32', 'cat_33', 'cat_34', 'cat_35', 'cat_36'))
+)
+,
+
+pre_pivot_5 AS 
+(
+SELECT cat_list, a.customer_pk2, 
+MAX(DATE(order_time)) AS cat_last_purchase_date
+
+FROM `algebraic-pier-225203.temp_bi.crosscat_pk` a
+LEFT JOIN `algebraic-pier-225203.Sales.sales_master`  s
+  ON SAFE_CAST(a.customer_pk2 AS FLOAT64) = s.customer_pk2
+INNER JOIN fixed_table t 
+  ON s.primary_category = t.cat_code
+WHERE DATE(order_time) >= '2022-04-01'
+  -- AND sales_application != 'POS'
+  AND app_type = 'MAIN'
+GROUP BY 1,2
+
+)
+,
+
+table_1_5_1 AS 
+(
+SELECT * 
+FROM pre_pivot_5
+PIVOT(MAX(cat_last_purchase_date) AS cat_last_purchase_date FOR cat_list IN ('cat_1', 'cat_2', 'cat_3', 'cat_4', 'cat_5', 'cat_6', 'cat_7', 'cat_8', 'cat_9', 'cat_10', 'cat_11', 'cat_12', 'cat_13', 'cat_14', 'cat_15', 'cat_16', 'cat_17', 'cat_18', 'cat_19', 'cat_20', 'cat_21', 'cat_22', 'cat_23', 'cat_24', 'cat_25', 'cat_26', 'cat_27', 'cat_28', 'cat_29', 'cat_30', 'cat_31', 'cat_32', 'cat_33', 'cat_34', 'cat_35', 'cat_36'))
+)
+
+SELECT a.*
+, b.* EXCEPT (customer_pk2), c.* EXCEPT(customer_pk2), d.* EXCEPT(customer_pk2), e.* EXCEPT(customer_pk2)
+FROM table_1_1 a
+LEFT JOIN table_1_2 b
+  ON a.customer_pk2 = b.customer_pk2
+LEFT JOIN table_1_3 c
+  ON a.customer_pk2 = c.customer_pk2
+LEFT JOIN table_1_4_1 d  
+  ON a.customer_pk2 = d.customer_pk2
+LEFT JOIN table_1_5_1 e
+  ON a.customer_pk2 = e.customer_pk2
