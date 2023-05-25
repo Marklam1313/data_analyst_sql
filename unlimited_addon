@@ -1,0 +1,68 @@
+WITH pre_final AS 
+(
+SELECT 
+order_time, order_number, customer_pk2, SUM(total_price) AS gmv_per_order, membership_level, additional_parent_order, unlimited_addon_parent_order, b.same_address_as_parent, b.same_delivery_date_timeslot,
+uao_meet_d_threshold,
+# entitled addon order logic
+CASE
+  WHEN 
+    unlimited_addon_parent_order IS NULL AND
+    additional_parent_order IS NULL AND
+    delivery_mode = 'hktv-standard-delivery' AND 
+    (
+      Type = 'Delivery' OR
+      Type = 'Shop pick-up' OR
+      Type = '3rd party pick-up' OR
+      Type = 'Restaurant pick-up'
+    ) AND 
+    app_type = 'MAIN' AND 
+    area_code IS NULL AND 
+    takeaway_store IS NULL THEN 'Y' ELSE 'N' END AS entitled_addon_order
+FROM `algebraic-pier-225203.Sales.sales_master` a
+LEFT JOIN
+(
+
+# find if parent order and unlimited addon order have the same pcode and delivery timeslot 
+SELECT 
+* EXCEPT(same_delivery_date_timeslot), 
+CASE 
+  WHEN REGEXP_CONTAINS(STRING_AGG(same_delivery_date_timeslot), 'N') THEN 'N' ELSE 'Y' END AS same_delivery_date_timeslot 
+FROM
+(
+SELECT
+DISTINCT b.unlimited_addon_parent_order AS parent_order, b.order_number AS additional_order, a.p_code AS parent_pcode, b.p_code AS addon_pcode,
+CASE 
+  WHEN 
+  a.p_code IS NULL AND 
+  b.p_code IS NULL THEN NULL
+  WHEN a.p_code = b.p_code THEN 'Y' ELSE 'N' END AS same_address_as_parent,
+CASE
+  WHEN b.delivery_date = a.delivery_date AND b.delivery_timeslot = a.delivery_timeslot THEN 'Y' ELSE 'N' END AS same_delivery_date_timeslot
+
+FROM `algebraic-pier-225203.Sales.sales_master` a #parent
+JOIN `algebraic-pier-225203.Sales.sales_master` b #addon
+  ON a.order_number = b.unlimited_addon_parent_order
+WHERE DATE(a.order_time) >= '2023-04-17'
+)
+GROUP BY 1,2,3,4,5
+) b
+  ON a.order_number = b.additional_order
+WHERE DATE(a.order_time) >= '2023-04-17'
+  AND sales_application != 'POS'
+GROUP BY 1,2,3,5,6,7,8,9,10,11
+)
+,
+
+final AS 
+(
+SELECT pre_final.* EXCEPT(gmv_per_order, entitled_addon_order), 
+CASE 
+  WHEN REGEXP_CONTAINS(STRING_AGG(entitled_addon_order), 'N') THEN 'N' ELSE 'Y' END AS entitled_addon_order,
+SUM(gmv_per_order) AS gmv
+FROM pre_final
+GROUP BY 1,2,3,4,5,6,7,8,9
+)
+
+
+SELECT *
+FROM final
